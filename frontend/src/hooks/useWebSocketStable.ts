@@ -92,7 +92,7 @@ export function useWebSocketStable({
     try {
     const sessionId = getSessionId();
     
-    const wsBaseUrl = process.env.NODE_ENV === 'production' ? 'wss://quickpoll-production-f532.up.railway.app' : 'ws://localhost:8000';
+    const wsBaseUrl = process.env.NODE_ENV === 'production' ? 'wss://quickpoll.up.railway.app' : 'ws://localhost:8000';
     const wsUrl = `${wsBaseUrl}/ws/${role}/${surveyId}?session_id=${sessionId}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;

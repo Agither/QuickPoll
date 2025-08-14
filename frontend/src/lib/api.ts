@@ -3,7 +3,7 @@
 import { getSessionId } from './session';
 
 const BASE_URL = process.env.NODE_ENV === 'production' 
-  ? 'https://quickpoll-production-f532.up.railway.app' 
+  ? 'https://quickpoll.up.railway.app' 
   : 'http://localhost:8000';
 
 // Type Definitions

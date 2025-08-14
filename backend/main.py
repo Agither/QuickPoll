@@ -272,7 +272,7 @@ try:
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables created successfully.")
 except Exception as e:
-    logger.error(f"Error creating database tables: {e}")
+    logger.warning(f"Database table creation failed (continuing anyway): {e}")
     # Fahre trotzdem fort - vielleicht sind die Tabellen bereits vorhanden
 
 # Sanfte Migration für owner_session Feld
@@ -324,7 +324,7 @@ try:
     ensure_owner_session_column()
     logger.info("Database migration completed.")
 except Exception as e:
-    logger.error(f"Database migration failed: {e}")
+    logger.warning(f"Database migration failed (continuing anyway): {e}")
     # Fahre trotzdem fort - Migration ist optional
 
 # Pydantic Models für API (Request/Response)
@@ -401,10 +401,30 @@ def get_db():
 
 # FastAPI App initialisieren
 app = FastAPI(
-    title="QuickPool API",
-    description="QuickPool API für UNI Umfragen und Feedbacks",
-    version="1.0.0"
+    title="QuickPoll API",
+    description="QuickPoll API für Railway Deployment mit Neon PostgreSQL",
+    version="2.0.0"
 )
+
+# Startup Event für Railway
+@app.on_event("startup")
+async def startup_event():
+    logger.info("🚀 QuickPoll Backend starting on Railway...")
+    logger.info(f"📊 Database: {DATABASE_URL}")
+    logger.info(f"🔧 Health Check: /health")
+    logger.info(f"📋 API Docs: /docs")
+    
+    # Teste Datenbank-Verbindung beim Start
+    try:
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
+        logger.info("✅ Database connection successful")
+    except Exception as e:
+        logger.warning(f"⚠️ Database connection failed: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("🛑 QuickPoll Backend shutting down...")
 
 # CORS Middleware für Frontend-Integration
 # Permissive CORS für Debugging
@@ -1192,11 +1212,14 @@ async def debug_surveys(db: Session = Depends(get_db)):
 async def root():
     """Willkommen bei der QuickPool API"""
     return {
-        "message": "Willkommen bei der QuickPoll API!",
-        "database": "SQLite",
+        "message": "🎯 QuickPoll Backend läuft auf Railway!",
+        "status": "healthy",
+        "database": "Neon PostgreSQL" if "postgresql" in DATABASE_URL else "SQLite",
         "docs": "/docs",
         "redoc": "/redoc",
-        "version": "1.0.0"
+        "health": "/health",
+        "version": "2.0.0 (Railway)",
+        "timestamp": datetime.now().isoformat()
     }
 
 # CORS Preflight Handler
@@ -1411,24 +1434,9 @@ async def handle_end_survey(survey_id: str, host_websocket: WebSocket):
     except Exception as e:
         print(f"Error ending survey: {e}")
 
-# Railway deployment - Server läuft persistent (nicht serverless)
-if __name__ == "__main__":
-    import uvicorn
-    
-    port = int(os.getenv("PORT", 8000))  # Railway setzt PORT Environment Variable
-    logger.info(f"🚀 Starting QuickPoll Backend on Railway")
-    logger.info(f"📊 Database: {DATABASE_URL}")
-    logger.info(f"🌐 Port: {port}")
-    logger.info(f"🔧 Health Check: /health")
-    
-    try:
-        uvicorn.run(
-            app, 
-            host="0.0.0.0", 
-            port=port,
-            log_level="info",
-            access_log=True
-        )
-    except Exception as e:
-        logger.error(f"❌ Failed to start server: {e}")
-        raise
+# Railway deployment: uvicorn wird über Procfile gestartet
+# Das Backend ist jetzt Railway-ready mit:
+# - Neon PostgreSQL Datenbank
+# - WebSocket Support
+# - Health Check Endpoint
+# - Robuste Fehlerbehandlung
