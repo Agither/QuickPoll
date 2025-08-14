@@ -11,6 +11,7 @@ import random
 import os
 import tempfile
 import asyncio
+import logging
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
@@ -20,6 +21,10 @@ class SurveyStatus(str, Enum):
     READY = "ready"  # Bereit zum Start
     ACTIVE = "active"  # Aktiv / Live
     FINISHED = "finished"  # Umfrage beendet
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # WebSocket Connection Manager
 class WebSocketManager:
@@ -154,6 +159,38 @@ def get_waiting_participants_count(survey_id: str) -> int:
     """Anzahl wartender Teilnehmer abrufen"""
     return len(participant_tracker.get(survey_id, set()))
 
+def get_submitted_participants_count(survey_id: str) -> int:
+    """Anzahl der Teilnehmer die bereits abgestimmt haben"""
+    with SessionLocal() as db:
+        try:
+            # Zähle eindeutige Responses für diese Umfrage
+            from sqlalchemy import func, distinct
+            count = db.query(func.count(distinct(ResponseDB.participant_name))).filter(
+                ResponseDB.survey_id == survey_id
+            ).scalar()
+            return count or 0
+        except Exception as e:
+            logger.error(f"Error counting submitted participants: {e}")
+            return 0
+
+def get_survey_by_id(survey_id: str):
+    """Hole Survey nach ID (einfache Version)"""
+    with SessionLocal() as db:
+        try:
+            survey = db.query(SurveyDB).filter(SurveyDB.id == survey_id).first()
+            if survey:
+                return {
+                    "id": survey.id,
+                    "title": survey.title,
+                    "description": survey.description,
+                    "is_started": survey.is_started,
+                    "created_at": survey.created_at
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error getting survey by ID: {e}")
+            return None
+
 def clear_waiting_participants(survey_id: str):
     """Alle wartenden Teilnehmer einer Umfrage entfernen"""
     if survey_id in participant_tracker:
@@ -161,14 +198,34 @@ def clear_waiting_participants(survey_id: str):
         print(f"Cleared all waiting participants for survey {survey_id}")
 
 # SQLAlchemy Imports
-from sqlalchemy import create_engine, String, DateTime, Boolean, Integer, Text, JSON, text
+from sqlalchemy import create_engine, String, DateTime, Boolean, Integer, Text, JSON, text, func, distinct
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session
 
-# Datenbank Setup
-# Für Vercel: Datenbank in /tmp schreiben da aktuelles Verzeichnis read-only ist
-DATABASE_PATH = "/tmp/survey_tool.db" if os.getenv("VERCEL") else "./survey_tool.db"
-SQLALCHEMY_DATABASE_URL = f"sqlite:///{DATABASE_PATH}"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+# Datenbank Setup für Railway mit Neon PostgreSQL
+# Railway kann DATABASE_URL setzen, fallback zu Neon PostgreSQL
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", 
+    "postgresql://neondb_owner:npg_uIo6gw4kiTZa@ep-empty-frog-a2r2xjd6-pooler.eu-central-1.aws.neon.tech/neondb?sslmode=require"
+)
+logger.info(f"Using database: {DATABASE_URL}")
+
+# SQLAlchemy Engine mit optimierten Einstellungen für Neon PostgreSQL
+if "postgresql" in DATABASE_URL:
+    # PostgreSQL für Neon/Railway Production
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,  # Überprüft Verbindungen vor Verwendung
+        pool_recycle=300,    # Erneuert Verbindungen alle 5 Minuten
+        pool_size=10,        # Angepasst für Neon limits
+        max_overflow=5,      # Zusätzliche Verbindungen bei Bedarf
+        connect_args={"options": "-c timezone=utc"}  # UTC Timezone für konsistente Zeitstempel
+    )
+    logger.info("Configured Neon PostgreSQL database")
+else:
+    # SQLite für lokale Entwicklung
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+    logger.info("Configured SQLite database for local development")
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 class Base(DeclarativeBase):
@@ -209,41 +266,66 @@ class ResponseDB(Base):
     answers: Mapped[list] = mapped_column(JSON, nullable=False)  # Als JSON gespeichert
     submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
-# Datenbank-Tabellen erstellen
-print("Creating database tables...")
-Base.metadata.create_all(bind=engine)
-print("Database tables created successfully.")
+# Datenbank-Tabellen erstellen (mit Fehlerbehandlung für Railway)
+try:
+    logger.info("Creating database tables...")
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created successfully.")
+except Exception as e:
+    logger.error(f"Error creating database tables: {e}")
+    # Fahre trotzdem fort - vielleicht sind die Tabellen bereits vorhanden
 
 # Sanfte Migration für owner_session Feld
 def ensure_owner_session_column():
-    """Fügt owner_session Spalte hinzu falls sie nicht existiert"""
+    """Fügt owner_session Spalte hinzu falls sie nicht existiert (PostgreSQL-kompatibel)"""
     db = SessionLocal()
     try:
-        print("Prüfe owner_session Spalte...")
-        # Prüfe ob die owner_session Spalte existiert
-        result = db.execute(text("PRAGMA table_info(surveys)")).fetchall()
-        columns = [row[1] for row in result]
-        print(f"Vorhandene Spalten: {columns}")
+        logger.info("Prüfe owner_session Spalte...")
         
-        if 'owner_session' not in columns:
-            print("Füge owner_session Spalte zur surveys Tabelle hinzu...")
-            db.execute(text("ALTER TABLE surveys ADD COLUMN owner_session TEXT DEFAULT ''"))
-            db.commit()
-            print("owner_session Spalte erfolgreich hinzugefügt.")
-        else:
-            print("owner_session Spalte bereits vorhanden.")
+        # PostgreSQL: Prüfe Spalten über information_schema
+        if "postgresql" in str(engine.url):
+            result = db.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'surveys' 
+                AND column_name = 'owner_session'
+            """)).fetchall()
             
+            if not result:
+                logger.info("Füge owner_session Spalte zur surveys Tabelle hinzu...")
+                db.execute(text("ALTER TABLE surveys ADD COLUMN owner_session VARCHAR DEFAULT ''"))
+                db.commit()
+                logger.info("owner_session Spalte erfolgreich hinzugefügt.")
+            else:
+                logger.debug("owner_session Spalte bereits vorhanden.")
+        else:
+            # SQLite fallback für lokale Entwicklung
+            result = db.execute(text("PRAGMA table_info(surveys)")).fetchall()
+            columns = [row[1] for row in result]
+            
+            if 'owner_session' not in columns:
+                logger.info("Füge owner_session Spalte zur surveys Tabelle hinzu...")
+                db.execute(text("ALTER TABLE surveys ADD COLUMN owner_session TEXT DEFAULT ''"))
+                db.commit()
+                logger.info("owner_session Spalte erfolgreich hinzugefügt.")
+            else:
+                logger.debug("owner_session Spalte bereits vorhanden.")
+                
     except Exception as e:
-        print(f"Migration Fehler: {e}")
+        logger.error(f"Migration Fehler: {e}")
         # Rollback bei Fehlern
         db.rollback()
     finally:
         db.close()
 
-# Migration beim Start ausführen
-print("Running database migration...")
-ensure_owner_session_column()
-print("Database migration completed.")
+# Migration beim Start ausführen (mit Fehlerbehandlung für Railway)
+try:
+    logger.info("Running database migration...")
+    ensure_owner_session_column()
+    logger.info("Database migration completed.")
+except Exception as e:
+    logger.error(f"Database migration failed: {e}")
+    # Fahre trotzdem fort - Migration ist optional
 
 # Pydantic Models für API (Request/Response)
 class QuestionType(str, Enum):
@@ -565,9 +647,19 @@ async def get_survey(survey_id: str, request: Request, db: Session = Depends(get
 async def get_public_survey(survey_id: str, db: Session = Depends(get_db)):
     """Öffentlicher Zugriff auf eine Umfrage für Teilnehmer"""
     try:
-        return get_survey_with_questions(db, survey_id)
-    except HTTPException:
+        logger.info(f"Public request for survey ID: {survey_id}")
+        # Debug: Check if any surveys exist
+        total_surveys = db.query(SurveyDB).count()
+        logger.info(f"Total surveys in database: {total_surveys}")
+        
+        survey = get_survey_with_questions(db, survey_id)
+        return survey
+    except HTTPException as e:
+        logger.error(f"HTTPException for survey {survey_id}: {e.detail}")
         raise HTTPException(status_code=404, detail="Umfrage nicht gefunden oder nicht verfügbar")
+    except Exception as e:
+        logger.error(f"Unexpected error for survey {survey_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Interner Serverfehler")
 
 @app.put("/surveys/{survey_id}", response_model=Survey, tags=["Surveys"])
 async def update_survey(survey_id: str, survey_data: SurveyBase, db: Session = Depends(get_db)):
@@ -1086,6 +1178,15 @@ async def health_check(db: Session = Depends(get_db)):
         "responses_count": responses_count
     }
 
+@app.get("/debug/surveys/", tags=["Debug"])
+async def debug_surveys(db: Session = Depends(get_db)):
+    """Debug: Liste aller Umfrage-IDs"""
+    surveys = db.query(SurveyDB.id, SurveyDB.title, SurveyDB.status).all()
+    return {
+        "total_count": len(surveys),
+        "surveys": [{"id": s.id, "title": s.title, "status": s.status} for s in surveys]
+    }
+
 # Root Endpoint
 @app.get("/", tags=["Root"])
 async def root():
@@ -1111,7 +1212,53 @@ async def options_handler(path: str):
             "Access-Control-Max-Age": "86400",
         }
     )
-# WebSocket Endpunkte
+
+# Health Check für Railway
+@app.get("/health")
+async def health_check():
+    """Health check endpoint für Railway deployment"""
+    try:
+        # Basis Health Check - Server ist erreichbar
+        return {
+            "status": "healthy",
+            "service": "QuickPoll Backend",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": str(e)}
+        )
+
+# Erweiterte Health Check mit Datenbank-Test
+@app.get("/health/detailed")
+async def detailed_health_check():
+    """Detaillierter Health check mit Datenbank-Test"""
+    try:
+        # Teste Datenbankverbindung
+        with SessionLocal() as db:
+            db.execute(text("SELECT 1"))
+        
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "service": "QuickPoll Backend",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Detailed health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy", 
+                "database": "disconnected",
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+
+# WebSocket Endpunkte für Railway (persistente Server-Verbindungen)
 @app.websocket("/ws/host/{survey_id}")
 async def websocket_host_endpoint(websocket: WebSocket, survey_id: str):
     """WebSocket für Survey-Hosts (ManageScreen/ResultScreen)"""
@@ -1264,8 +1411,24 @@ async def handle_end_survey(survey_id: str, host_websocket: WebSocket):
     except Exception as e:
         print(f"Error ending survey: {e}")
 
-### not needed for vercel deployment
-#
-#if __name__ == "__main__":
-#    import uvicorn
-#    uvicorn.run(app, host="0.0.0.0", port=8000) #Hier wird später der Port angepasst
+# Railway deployment - Server läuft persistent (nicht serverless)
+if __name__ == "__main__":
+    import uvicorn
+    
+    port = int(os.getenv("PORT", 8000))  # Railway setzt PORT Environment Variable
+    logger.info(f"🚀 Starting QuickPoll Backend on Railway")
+    logger.info(f"📊 Database: {DATABASE_URL}")
+    logger.info(f"🌐 Port: {port}")
+    logger.info(f"🔧 Health Check: /health")
+    
+    try:
+        uvicorn.run(
+            app, 
+            host="0.0.0.0", 
+            port=port,
+            log_level="info",
+            access_log=True
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to start server: {e}")
+        raise

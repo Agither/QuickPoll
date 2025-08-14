@@ -6,3 +6,4 @@ python-multipart
 openpyxl
 python-dateutil
 websockets
+psycopg2-binary
