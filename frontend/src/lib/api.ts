@@ -3,7 +3,7 @@
 import { getSessionId } from './session';
 
 const BASE_URL = process.env.NODE_ENV === 'production' 
-  ? 'https://quick-poll-a49h.vercel.app' 
+  ? 'https://quickpoll-production-f532.up.railway.app' 
   : 'http://localhost:8000';
 
 // Type Definitions
@@ -58,7 +58,7 @@ export interface HealthResponse {
 }
 
 // Basis-Fetch-Funktion mit Fehlerbehandlung
-async function apiRequest<T>(
+export async function apiRequest<T>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
